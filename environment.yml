@@ -1,0 +1,15 @@
+name: computervision
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy
+  - matplotlib
+  - scikit-learn
+  - opencv
+  - pytorch
+  - torchvision
+  - scikit-image
+  - ipykernel
