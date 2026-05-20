@@ -1,6 +1,7 @@
 import os
 import random
 import time
+import json
 import matplotlib.pyplot as plt
 from IPython.display import clear_output
 from PIL import Image
@@ -9,24 +10,27 @@ import torch.nn as nn
 from torch.utils.data import Dataset
 import torchvision.transforms as transforms
 import torch.optim as optim
+import torchvision.transforms.functional as TF
 
 
-
+# ---------------------------------------------------------
 # ---------------------------------------------------------
 # DATASET: LOADING AND PREPROCESSING
 # ---------------------------------------------------------
+# ---------------------------------------------------------
 
 class MapsDataset(Dataset):
-    def __init__(self, root_dir, transform=None):
+    def __init__(self, root_dir, transform=None, augment = False):
         """
         Args:
             root_dir (string): Directory with all the images.
             transform (callable, optional): Optional transform to be applied on a sample.
+            augment (Boolean, optional): Optional apply data augmentation on the training set.
         """
         self.root_dir = root_dir
         self.image_files = [f for f in os.listdir(root_dir) if f.endswith(('.png', '.jpg', '.jpeg'))]
         self.transform = transform
-
+        self.augment = augment
     def __len__(self):
         return len(self.image_files)
 
@@ -60,6 +64,25 @@ class MapsDataset(Dataset):
             torch.manual_seed(seed)
             random.seed(seed)
             target_image = self.transform(target_image)
+
+        if self.augment:
+            # Include data augmentation
+
+            # Horizontal Flip 
+            if random.random() > 0.5:
+                input_map = TF.hflip(input_map)
+                target_image = TF.hflip(target_image)
+            
+            # Vertical Flip 
+            if random.random() > 0.5:
+                input_map = TF.vflip(input_map)
+                target_image = TF.vflip(target_image)
+
+            # Rotation 
+            if random.random() > 0.5:
+                angle = random.choice([90, 180, 270])
+                input_map = TF.rotate(input_map, angle)
+                target_image = TF.rotate(target_image, angle)
             
         return input_map, target_image
 
@@ -83,7 +106,9 @@ def unnormalize(tensor):
 
 
 # ---------------------------------------------------------
+# ---------------------------------------------------------
 # GENERATOR (U-NET) COMPONENTS
+# ---------------------------------------------------------
 # ---------------------------------------------------------
 
 class UNetDown(nn.Module):
@@ -202,8 +227,11 @@ class GeneratorUNet(nn.Module):
 
 
 # ---------------------------------------------------------
+# ---------------------------------------------------------
 # DISCRIMINATOR (PATCHGAN)
 # ---------------------------------------------------------
+# ---------------------------------------------------------
+
 class Discriminator(nn.Module):
     def __init__(self, in_channels=3):
         super().__init__()
@@ -255,8 +283,11 @@ class Discriminator(nn.Module):
     
 
 # ---------------------------------------------------------
+# ---------------------------------------------------------
 # TRAINING LOOP
 # ---------------------------------------------------------
+# ---------------------------------------------------------
+
 def train_pix2pix(generator, discriminator, train_loader, val_loader, device, 
                   criterion_GAN, criterion_pixelwise, optimizer_G, optimizer_D,
                   epochs=10, lambda_l1=100):
@@ -431,9 +462,334 @@ def train_pix2pix(generator, discriminator, train_loader, val_loader, device,
     return generator, discriminator
 
 
+
+def train_pix2pix_v2(generator, discriminator, train_loader, val_loader, device, 
+                  criterion_GAN, criterion_pixelwise, optimizer_G, optimizer_D,
+                  epochs=100, lambda_l1=100, patience=20, output_dir="trained_models", model_name="pix2pix"):
+
+    """
+    Trains the Pix2Pix model with integrated validation, learning rate scheduling, 
+    and early stopping. Best model weights are saved automatically.
+
+    Args:
+        generator (nn.Module): The generator network (typically a U-Net).
+        discriminator (nn.Module): The discriminator network (typically a PatchGAN).
+        train_loader (DataLoader): PyTorch DataLoader for the training set.
+        val_loader (DataLoader): PyTorch DataLoader for the validation set.
+        device (torch.device): Computation device (e.g., 'cuda' or 'cpu').
+        criterion_GAN (nn.Module): Adversarial loss (e.g., BCEWithLogitsLoss).
+        criterion_pixelwise (nn.Module): Pixel-level loss (e.g., L1Loss).
+        optimizer_G (torch.optim.Optimizer): Optimizer for the generator.
+        optimizer_D (torch.optim.Optimizer): Optimizer for the discriminator.
+        epochs (int, optional): Maximum number of training epochs. Defaults to 100.
+        lambda_l1 (float, optional): Weight for the pixel-wise L1 loss. Defaults to 100.
+        patience (int, optional): Number of epochs to wait for improvement before 
+            triggering early stopping. Defaults to 20.
+        output_dir (str, optional): Directory where the best models will be saved. 
+            Defaults to "trained_models".
+        model_name (str, optional): Prefix used for the saved model filenames. 
+            Defaults to "pix2pix".
+
+    Returns:
+        tuple: (generator, discriminator, history) 
+            - generator: The trained generator model.
+            - discriminator: The trained discriminator model.
+            - history (dict): Dictionary containing training and validation loss logs.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"Starting Training: {model_name} on {device}")
+
+    # History dictionary
+    history = {
+        "train_G": [], "train_D": [],
+        "val_G": [], "val_D": []
+    }
+
+    # Early Stopping & LR Decay Setup
+    best_val_loss = float('inf')
+    early_stop_counter = 0
+    
+    # Scheduler: Reduce lr by factor if loss doesn't improve in half early stop patience
+    scheduler_G = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer_G, mode='min', factor=0.7, patience=patience//2)
+    scheduler_D = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer_D, mode='min', factor=0.7, patience=patience//2)
+
+    for epoch in range(epochs):
+        start_time = time.time()
+        epoch_loss_D, epoch_loss_G = 0.0, 0.0
+        
+        generator.train()
+        discriminator.train()
+        
+        for condition_map, real_image in train_loader:
+            condition_map, real_image = condition_map.to(device), real_image.to(device)
+            
+            # --- PHASE 1: DISCRIMINATOR ---
+            optimizer_D.zero_grad()
+            pred_real = discriminator(condition_map, real_image)
+            loss_real = criterion_GAN(pred_real, torch.ones_like(pred_real).to(device))
+            
+            fake_image = generator(condition_map)
+            pred_fake = discriminator(condition_map, fake_image.detach())
+            loss_fake = criterion_GAN(pred_fake, torch.zeros_like(pred_fake).to(device))
+            
+            loss_D = (loss_real + loss_fake) * 0.5
+            loss_D.backward()
+            optimizer_D.step()
+            
+            # --- PHASE 2: GENERATOR ---
+            optimizer_G.zero_grad()
+            pred_fake_for_G = discriminator(condition_map, fake_image)
+            loss_G_GAN = criterion_GAN(pred_fake_for_G, torch.ones_like(pred_fake_for_G).to(device))
+            loss_G_L1 = criterion_pixelwise(fake_image, real_image)
+            
+            loss_G = loss_G_GAN + (lambda_l1 * loss_G_L1)
+            loss_G.backward()
+            optimizer_G.step()
+
+            epoch_loss_D += loss_D.item()
+            epoch_loss_G += loss_G.item()
+
+        # --- VALIDATION PHASE ---
+        val_epoch_loss_D, val_epoch_loss_G = 0.0, 0.0
+        generator.eval()
+        discriminator.eval()
+        
+        with torch.no_grad():
+            for val_map, val_real in val_loader:
+                val_map, val_real = val_map.to(device), val_real.to(device)
+                v_fake = generator(val_map)
+                
+                v_loss_D = (criterion_GAN(discriminator(val_map, val_real), torch.ones_like(discriminator(val_map, val_real)).to(device)) + 
+                            criterion_GAN(discriminator(val_map, v_fake), torch.zeros_like(discriminator(val_map, v_fake)).to(device))) * 0.5
+                v_loss_G = criterion_GAN(discriminator(val_map, v_fake), torch.ones_like(discriminator(val_map, v_fake)).to(device)) + (lambda_l1 * criterion_pixelwise(v_fake, val_real))
+                
+                val_epoch_loss_D += v_loss_D.item()
+                val_epoch_loss_G += v_loss_G.item()
+
+        # Metrics 
+        avg_train_G, avg_val_G = epoch_loss_G / len(train_loader), val_epoch_loss_G / len(val_loader)
+        avg_train_D, avg_val_D = epoch_loss_D / len(train_loader), val_epoch_loss_D / len(val_loader)
+        
+        history["train_G"].append(avg_train_G); history["val_G"].append(avg_val_G)
+        history["train_D"].append(avg_train_D); history["val_D"].append(avg_val_D)
+
+        # LR Scheduling based on Validation Loss G
+        scheduler_G.step(avg_val_G)
+        scheduler_D.step(avg_val_D)
+        current_lr = optimizer_G.param_groups[0]['lr']
+        print(f"Epoch [{epoch+1}/{epochs}] - train_G_Loss: {avg_train_G:.4f} | train_D_Loss: {avg_train_D:.4f} val_G_Loss: {avg_val_G:.4f} | val_D_Loss: {avg_val_D:.4f} | LR: {current_lr:.6f} |Time: {time.time()-start_time:.2f}s")
+
+        # --- CHECKPOINT & EARLY STOPPING ---
+        if avg_val_G < best_val_loss:
+            best_val_loss = avg_val_G
+            early_stop_counter = 0
+            # Save best model
+            torch.save(generator.state_dict(), os.path.join(output_dir, f"best_G_{model_name}.pth"))
+            torch.save(discriminator.state_dict(), os.path.join(output_dir, f"best_D_{model_name}.pth"))
+        else:
+            early_stop_counter += 1
+            if early_stop_counter >= patience:
+                print(f"Early stopping triggered at epoch {epoch+1}")
+                break
+
+    return generator, discriminator, history
+
+def train_pix2pix_v3(generator, discriminator, train_loader, val_loader, device, 
+                     criterion_GAN, criterion_pixelwise, optimizer_G, optimizer_D,
+                     epochs=500, lambda_l1=300, step_size=100, save_step=50, 
+                     output_dir="trained_models", model_name="pix2pix"):
+    """
+    Trains the Pix2Pix model with periodic checkpointing, automated history logging, 
+    and StepLR decay. This version is optimized for longer training runs.
+
+    Args:
+        generator (nn.Module): The generator network.
+        discriminator (nn.Module): The discriminator network.
+        train_loader (DataLoader): PyTorch DataLoader for the training set.
+        val_loader (DataLoader): PyTorch DataLoader for the validation set.
+        device (torch.device): Computation device (e.g., 'cuda' or 'cpu').
+        criterion_GAN (nn.Module): Adversarial loss function.
+        criterion_pixelwise (nn.Module): Pixel-wise loss function (typically L1).
+        optimizer_G (torch.optim.Optimizer): Optimizer for the generator.
+        optimizer_D (torch.optim.Optimizer): Optimizer for the discriminator.
+        epochs (int, optional): Total number of training epochs. Defaults to 500.
+        lambda_l1 (int, optional): Weight for the L1 pixel-wise loss. Defaults to 300.
+        step_size (int, optional): Period of learning rate decay in epochs. Defaults to 100.
+        save_step (int, optional): Interval of epochs to save model checkpoints 
+            and JSON history. Defaults to 50.
+        output_dir (str, optional): Directory to save models and logs. Defaults to "trained_models".
+        model_name (str, optional): Name used for saved files. Defaults to "pix2pix".
+
+    Returns:
+        tuple: (generator, discriminator, history)
+            - generator: Trained generator model.
+            - discriminator: Trained discriminator model.
+            - history (dict): Dictionary containing training/validation loss metrics.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    history_path = os.path.join(output_dir, f"history_{model_name}.json")
+    print(f"Starting Training: {model_name} on {device}")
+
+    history = {
+        "train_G": [], "train_D": [],
+        "val_G": [], "val_D": []
+    }
+
+    best_val_loss = float('inf')
+    
+    # Reduce LR by 0.7 factor each step_size epochs
+    scheduler_G = torch.optim.lr_scheduler.StepLR(optimizer_G, step_size=step_size, gamma=0.7)
+    scheduler_D = torch.optim.lr_scheduler.StepLR(optimizer_D, step_size=step_size, gamma=0.7)
+
+    for epoch in range(epochs):
+        start_time = time.time()
+        epoch_loss_D, epoch_loss_G = 0.0, 0.0
+        
+        generator.train()
+        discriminator.train()
+        
+        for condition_map, real_image in train_loader:
+            condition_map, real_image = condition_map.to(device), real_image.to(device)
+            
+            # Discriminator
+            optimizer_D.zero_grad()
+            pred_real = discriminator(condition_map, real_image)
+            loss_real = criterion_GAN(pred_real, torch.ones_like(pred_real).to(device))
+            
+            fake_image = generator(condition_map)
+            pred_fake = discriminator(condition_map, fake_image.detach())
+            loss_fake = criterion_GAN(pred_fake, torch.zeros_like(pred_fake).to(device))
+            
+            loss_D = (loss_real + loss_fake) * 0.5
+            loss_D.backward()
+            optimizer_D.step()
+            
+            # Generator
+            optimizer_G.zero_grad()
+            pred_fake_for_G = discriminator(condition_map, fake_image)
+            loss_G_GAN = criterion_GAN(pred_fake_for_G, torch.ones_like(pred_fake_for_G).to(device))
+            loss_G_L1 = criterion_pixelwise(fake_image, real_image)
+            
+            loss_G = loss_G_GAN + (lambda_l1 * loss_G_L1)
+            loss_G.backward()
+            optimizer_G.step()
+
+            epoch_loss_D += loss_D.item()
+            epoch_loss_G += loss_G.item()
+
+        # Validation
+        val_epoch_loss_D, val_epoch_loss_G = 0.0, 0.0
+        generator.eval()
+        discriminator.eval()
+        
+        with torch.no_grad():
+            for val_map, val_real in val_loader:
+                val_map, val_real = val_map.to(device), val_real.to(device)
+                v_fake = generator(val_map)
+                
+                v_pred_real = discriminator(val_map, val_real)
+                v_pred_fake = discriminator(val_map, v_fake)
+                
+                v_loss_D = (criterion_GAN(v_pred_real, torch.ones_like(v_pred_real).to(device)) + 
+                            criterion_GAN(v_pred_fake, torch.zeros_like(v_pred_fake).to(device))) * 0.5
+                v_loss_G = criterion_GAN(v_pred_fake, torch.ones_like(v_pred_fake).to(device)) + (lambda_l1 * criterion_pixelwise(v_fake, val_real))
+                
+                val_epoch_loss_D += v_loss_D.item()
+                val_epoch_loss_G += v_loss_G.item()
+
+        # Calculate average metrics per epoch
+        avg_train_G, avg_val_G = epoch_loss_G / len(train_loader), val_epoch_loss_G / len(val_loader)
+        avg_train_D, avg_val_D = epoch_loss_D / len(train_loader), val_epoch_loss_D / len(val_loader)
+        
+        history["train_G"].append(avg_train_G); history["val_G"].append(avg_val_G)
+        history["train_D"].append(avg_train_D); history["val_D"].append(avg_val_D)
+
+        # Update schedulers
+        scheduler_G.step()
+        scheduler_D.step()
+        
+        current_lr = optimizer_G.param_groups[0]['lr']
+        print(f"Epoch [{epoch+1}/{epochs}] - G_Loss: {avg_val_G:.4f} | D_Loss: {avg_val_D:.4f} | LR: {current_lr:.6f} | Time: {time.time()-start_time:.2f}s")
+
+        # Checkpoints
+        # Save best val_G loss model
+        if avg_val_G < best_val_loss:
+            best_val_loss = avg_val_G
+            torch.save(generator.state_dict(), os.path.join(output_dir, f"best_G_{model_name}.pth"))
+        
+        # Save each n_steps epochs
+        if (epoch + 1) % save_step == 0:
+            torch.save(generator.state_dict(), os.path.join(output_dir, f"epoch_{epoch+1}_G_{model_name}.pth"))
+             # Save history every 50 epochs in case kernel died
+            with open(history_path, 'w') as f:
+                json.dump(history, f)
+            print(f"Checkpoint and History saved at epoch {epoch+1}")
+
+    return generator, discriminator, history
+
+def plot_training_history(history, earlystopping = None):
+
+    """
+    Plots the training and validation loss curves for both the Generator and Discriminator.
+
+    This function visualizes the evolution of GAN losses over epochs, allowing for 
+    comparison between training and validation performance. It can also highlight 
+    the best model checkpoint based on the minimum validation loss.
+
+    Args:
+        history (dict): A dictionary containing the following keys:
+            - "train_G": List of generator training losses.
+            - "train_D": List of discriminator training losses.
+            - "val_G": List of generator validation losses.
+            - "val_D": List of discriminator validation losses.
+        earlystopping (bool, optional): If True, draws a vertical line at the epoch 
+            with the lowest Generator validation loss, indicating where the best 
+            model was likely saved. Defaults to None.
+
+    Returns:
+        None: Displays a Matplotlib plot.
+    """
+    plt.figure(figsize=(12, 6))
+    plt.title("Pix2Pix Training History: Generator vs Discriminator Loss")
+    
+    # Extraer datos del diccionario
+    train_G = history["train_G"]
+    train_D = history["train_D"]
+    val_G = history["val_G"]
+    val_D = history["val_D"]
+    epochs = range(1, len(train_G) + 1)
+
+    # Plot Train Losses (líneas sólidas)
+    plt.plot(epochs, train_G, label="Train G Loss (Adversarial + L1)", color="blue", linestyle="-", linewidth=1.5)
+    plt.plot(epochs, train_D, label="Train D Loss (PatchGAN)", color="orange", linestyle="-", linewidth=1.5)
+    
+    # Plot Validation Losses (líneas discontinuas)
+    plt.plot(epochs, val_G, label="Val G Loss", color="blue", linestyle="--", linewidth=1.5, alpha=0.7)
+    plt.plot(epochs, val_D, label="Val D Loss", color="orange", linestyle="--", linewidth=1.5, alpha=0.7)
+    
+    plt.xlabel("Epochs")
+    plt.ylabel("Loss Value")
+    plt.legend(loc="upper right")
+    plt.grid(True, alpha=0.3)
+    
+
+    if earlystopping:
+        # Find the epoch-index
+        min_val_idx = val_G.index(min(val_G))
+        
+        # Mark the bets model saved according to val G loss
+        plt.axvline(x=min_val_idx + 1, color='red', linestyle='--', alpha=0.4, label='Best Model')
+
+    plt.tight_layout()
+    plt.show()
+
+
 # ---------------------------------------------------------
-# VISUALIZATION UTILITY
 # ---------------------------------------------------------
+# VISUALIZATION AND TEST UTILITY 
+# ---------------------------------------------------------
+# ---------------------------------------------------------
+
 def visualize_prediction(generator, dataloader, device):
     """
     Takes a single batch from the dataloader, generates a prediction using the trained model,
@@ -476,3 +832,100 @@ def visualize_prediction(generator, dataloader, device):
         axes[2].axis("off")
         
         plt.show()
+
+
+def model_benchmark(generator, dataset, device, num_samples=3, indexes=None):
+    """
+    Benchmark fucntion to evaluate the performance of the different models.
+    Take indexes of relevant images if given.
+    If indexes is None, take random samples with a fixed seed to ensure reproducibility.
+    Args:
+        generator(nn.Module): Trained generator network.
+        dataset(torch.Subset): The subset of images to be tested.
+        device(torch.device): The computation device.
+        num_samples(int): Number of random samples to be tested.
+        indexes(list): List containing the indexes of the images in the dataset to be tested.
+    """
+    generator.eval()
+    
+    
+    if indexes is None:
+        # Fix random seed
+        random.seed(42) 
+        indexes = [random.randint(0, len(dataset) - 1) for _ in range(num_samples)]
+    
+    fig, axes = plt.subplots(num_samples, 3, figsize=(15, 5 * num_samples))
+    
+    for i, idx in enumerate(indexes):
+        # Get the map and image from original dataset
+        input_map, real_image = dataset[idx]
+        
+        # prepare the input 
+        input_tensor = input_map.unsqueeze(0).to(device)
+        
+        with torch.no_grad():
+            generated_image = generator(input_tensor)
+        
+        # Unnormalize  ( [-1, 1] --> [0, 1])
+        map_viz = unnormalize(input_map).permute(1, 2, 0).cpu()
+        gen_viz = unnormalize(generated_image[0]).permute(1, 2, 0).cpu()
+        real_viz = unnormalize(real_image).permute(1, 2, 0).cpu()
+        
+        # Plot
+        axes[i, 0].imshow(map_viz)
+        axes[i, 0].set_title(f"Input (Idx {idx})")
+        axes[i, 1].imshow(gen_viz)
+        axes[i, 1].set_title("Generated (Output)")
+        axes[i, 2].imshow(real_viz)
+        axes[i, 2].set_title("Real (Target)")
+        
+        for ax in axes[i]:
+            ax.axis("off")
+            
+    plt.tight_layout()
+    plt.show()
+
+def evaluate_test_l1(generator, test_loader, device):
+    """
+    Evaluates the generator's performance on the test dataset using the L1 loss metric.
+
+    This function sets the generator to evaluation mode and computes the average 
+    Mean Absolute Error (L1 loss) between the generated images and the ground truth 
+    across the entire test set. It provides a quantitative measure of the model's 
+    pixel-wise reconstruction accuracy.
+
+    Args:
+        generator (nn.Module): The trained generator model to be evaluated.
+        test_loader (DataLoader): PyTorch DataLoader containing the test dataset.
+        device (torch.device): Computation device (e.g., 'cuda' or 'cpu').
+
+    Returns:
+        float: The average L1 loss value for the test set.
+    """
+    generator.eval()
+    criterion_l1 = nn.L1Loss()
+    total_test_l1 = 0.0
+    
+    print(f"Runing L1 loss evaluation on Test set...")
+    
+    with torch.no_grad():
+        for condition_map, real_image in test_loader:
+            condition_map = condition_map.to(device)
+            real_image = real_image.to(device)
+            
+            fake_image = generator(condition_map)
+            loss_l1 = criterion_l1(fake_image, real_image)
+            
+            total_test_l1 += loss_l1.item()
+            
+    avg_test_l1 = total_test_l1 / len(test_loader)
+    print(f"AVERAGE L1 LOSS (TEST): {avg_test_l1:.6f}")
+    
+    return avg_test_l1
+
+
+
+
+
+
+
