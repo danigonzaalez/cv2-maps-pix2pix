@@ -38,7 +38,7 @@ If you are unsure about the required arguments or want to see all available opti
 ```bash
 python demo.py --help
 ```
-4. Train and Evaluate Models
+## Train and Evaluate Models
 
 Two notebooks are provided in the `training_and_evaluation` folder:
 
