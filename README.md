@@ -24,7 +24,7 @@ Download the models from the [Releases page](https://github.com/danigonzaalez/cv
 You can test the downloaded models using any of the provided sample images. For instance, run the following command from the terminal:
 
 ```bash
-python demo.py --image maps/image_001.jpg --model models/epoch_200_G_lambda_100.pth --output results/
+python demo.py --image maps/image_001.jpg --model models/baseline.pth --output results/
 ```
 
 This will run inference on the sample map and save a comparative plot (Input vs Generated vs Real) inside the results/ directory using the indicated model.
