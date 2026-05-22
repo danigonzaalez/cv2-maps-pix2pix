@@ -46,4 +46,5 @@ Two notebooks are provided in the `training_and_evaluation` folder:
 * **`Benchmark.ipynb`**: Used to evaluate the saved models.
 
 Before running either notebook, it is highly recommended to replicate the original training environment using the provided `training_environment.yml` file.
+Also the notebooks should be located at the same folder path than the `utils.py` and the `/maps folder`.
    
