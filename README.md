@@ -38,3 +38,12 @@ If you are unsure about the required arguments or want to see all available opti
 ```bash
 python demo.py --help
 ```
+4. Train and Evaluate Models
+
+Two notebooks are provided in the `training_and_evaluation` folder:
+
+* **`training.ipynb`**: Used to train the models. Running this notebook will automatically save the trained models into a new folder for later use.
+* **`Benchmark.ipynb`**: Used to evaluate the saved models.
+
+Before running either notebook, it is highly recommended to replicate the original training environment using the provided `training_environment.yml` file.
+   
