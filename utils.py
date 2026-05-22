@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 from IPython.display import clear_output
 from PIL import Image
 import torch
+import torch.nn.functional as F
 import torch.nn as nn
 from torch.utils.data import Dataset
 import torchvision.transforms as transforms
@@ -287,180 +288,6 @@ class Discriminator(nn.Module):
 # TRAINING LOOP
 # ---------------------------------------------------------
 # ---------------------------------------------------------
-
-def train_pix2pix(generator, discriminator, train_loader, val_loader, device, 
-                  criterion_GAN, criterion_pixelwise, optimizer_G, optimizer_D,
-                  epochs=10, lambda_l1=100):
-    """
-    Trains the Pix2Pix model, evaluates on the validation set per epoch, 
-    and visualizes the results and loss plots at the end of training.
-    
-    Args:
-        generator (nn.Module): The generator network (U-Net) that creates fake images.
-        discriminator (nn.Module): The discriminator network (PatchGAN) that classifies images.
-        train_loader (DataLoader): PyTorch DataLoader containing the training dataset.
-        val_loader (DataLoader): PyTorch DataLoader containing the validation dataset.
-        device (torch.device): The computation device to use (e.g., 'cuda' or 'cpu').
-        criterion_GAN (nn.Module): Adversarial loss function to evaluate realism (e.g., BCEWithLogitsLoss).
-        criterion_pixelwise (nn.Module): Pixel-wise loss function for structural accuracy (e.g., L1Loss).
-        optimizer_G (torch.optim.Optimizer): The optimization algorithm for the generator.
-        optimizer_D (torch.optim.Optimizer): The optimization algorithm for the discriminator.
-        epochs (int, optional): The total number of full passes over the training dataset. Defaults to 10.
-        lambda_l1 (float or int, optional): The weight multiplier applied to the pixel-wise loss. Defaults to 100.
-        
-    Returns:
-        tuple: A tuple containing the fully trained (generator, discriminator) models.
-    """
-    print(f"Starting Training Loop for {epochs} epochs...")
-
-    # Initialize lists to store average epoch losses for both Train and Validation
-    train_losses_D, train_losses_G = [], []
-    val_losses_D, val_losses_G = [], []
-
-    for epoch in range(epochs):
-        start_time = time.time()
-
-        # Variables to accumulate loss for the current epoch (Training)
-        epoch_loss_D = 0.0
-        epoch_loss_G = 0.0
-        
-        # Set models to training mode to enable dropout and batch normalization tracking
-        generator.train()
-        discriminator.train()
-        
-        for i, (condition_map, real_image) in enumerate(train_loader):
-            # Move data to the active device
-            condition_map = condition_map.to(device)
-            real_image = real_image.to(device)
-            
-            # ==================================================
-            # PHASE 1: TRAIN DISCRIMINATOR (D)
-            # Goal: Maximize the probability of correctly classifying Real and Fake images.
-            # ==================================================
-            optimizer_D.zero_grad() # Clear previous gradients
-            
-            # 1. Train with REAL images
-            pred_real = discriminator(condition_map, real_image)
-            target_real = torch.ones_like(pred_real).to(device) # Real labels are 1s
-            loss_real = criterion_GAN(pred_real, target_real)
-            
-            # 2. Train with FAKE images
-            fake_image = generator(condition_map)
-            pred_fake = discriminator(condition_map, fake_image.detach())
-            target_fake = torch.zeros_like(pred_fake).to(device) # Fake labels are 0s
-            loss_fake = criterion_GAN(pred_fake, target_fake)
-            
-            # 3. Compute total D loss and update weights
-            loss_D = (loss_real + loss_fake) * 0.5 
-            loss_D.backward()
-            optimizer_D.step()
-            
-            # ==================================================
-            # PHASE 2: TRAIN GENERATOR (G)
-            # Goal: Minimize the difference between generated and real images (L1), 
-            # and fool the discriminator (Adversarial).
-            # ==================================================
-            optimizer_G.zero_grad() # Clear previous gradients
-            
-            # 1. Adversarial Loss (Fooling D)
-            pred_fake_for_G = discriminator(condition_map, fake_image)
-            loss_G_GAN = criterion_GAN(pred_fake_for_G, target_real) 
-            
-            # 2. Pixel-wise Loss (Structural accuracy)
-            loss_G_L1 = criterion_pixelwise(fake_image, real_image)
-            
-            # 3. Compute total G loss and update weights
-            loss_G = loss_G_GAN + (lambda_l1 * loss_G_L1)
-            loss_G.backward()
-            optimizer_G.step()
-
-            # Add batch loss to epoch accumulators
-            epoch_loss_D += loss_D.item()
-            epoch_loss_G += loss_G.item()
-
-        # ==================================================
-        # VALIDATION PHASE
-        # ==================================================
-        # Variables to accumulate loss for the current epoch (Validation)
-        val_epoch_loss_D = 0.0
-        val_epoch_loss_G = 0.0
-        
-        # Set models to evaluation mode (turns off dropout, fixes batchnorm)
-        generator.eval()
-        discriminator.eval()
-        
-        with torch.no_grad(): # Disable gradient computation
-            for val_map, val_real in val_loader:
-                val_map = val_map.to(device)
-                val_real = val_real.to(device)
-                
-                # Forward passes for validation
-                val_fake_image = generator(val_map)
-                
-                # Discriminator Validation Loss
-                val_pred_real = discriminator(val_map, val_real)
-                val_loss_real = criterion_GAN(val_pred_real, torch.ones_like(val_pred_real).to(device))
-                
-                val_pred_fake = discriminator(val_map, val_fake_image)
-                val_loss_fake = criterion_GAN(val_pred_fake, torch.zeros_like(val_pred_fake).to(device))
-                
-                v_loss_D = (val_loss_real + val_loss_fake) * 0.5
-                val_epoch_loss_D += v_loss_D.item()
-                
-                # Generator Validation Loss
-                val_pred_fake_for_G = discriminator(val_map, val_fake_image)
-                v_loss_G_GAN = criterion_GAN(val_pred_fake_for_G, torch.ones_like(val_pred_fake_for_G).to(device))
-                v_loss_G_L1 = criterion_pixelwise(val_fake_image, val_real)
-                
-                v_loss_G = v_loss_G_GAN + (lambda_l1 * v_loss_G_L1)
-                val_epoch_loss_G += v_loss_G.item()
-
-        # ==================================================
-        # END OF EPOCH PROCESSING
-        # ==================================================
-        epoch_duration = time.time() - start_time
-        
-        # Calculate average losses for the epoch (Train & Validation)
-        avg_train_loss_D = epoch_loss_D / len(train_loader)
-        avg_train_loss_G = epoch_loss_G / len(train_loader)
-        avg_val_loss_D = val_epoch_loss_D / len(val_loader)
-        avg_val_loss_G = val_epoch_loss_G / len(val_loader)
-        
-        # Append to main lists
-        train_losses_D.append(avg_train_loss_D)
-        train_losses_G.append(avg_train_loss_G)
-        val_losses_D.append(avg_val_loss_D)
-        val_losses_G.append(avg_val_loss_G)
-        
-        # Print epoch summary
-        print(f"---- Epoch [{epoch+1}/{epochs}] finished in {epoch_duration:.2f} seconds ----")
-        print(f"Train - D Loss: {avg_train_loss_D:.4f} | G Loss: {avg_train_loss_G:.4f}")
-        print(f"Val   - D Loss: {avg_val_loss_D:.4f} | G Loss: {avg_val_loss_G:.4f}\n")
-            
-    # ==================================================
-    # END OF TRAINING: PLOT LOSSES & VISUALIZE SAMPLE
-    # ==================================================
-    
-    # 1. Plotting the losses
-    plt.figure(figsize=(12, 6))
-    plt.title("Generator and Discriminator Loss (Train vs Validation)")
-    
-    # Plot Train Losses (solid lines)
-    plt.plot(train_losses_G, label="Train G Loss", color="blue", linestyle="-")
-    plt.plot(train_losses_D, label="Train D Loss", color="orange", linestyle="-")
-    
-    # Plot Validation Losses (dashed lines)
-    plt.plot(val_losses_G, label="Val G Loss", color="blue", linestyle="--")
-    plt.plot(val_losses_D, label="Val D Loss", color="orange", linestyle="--")
-    
-    plt.xlabel("Epochs")
-    plt.ylabel("Loss")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.show()
-            
-    return generator, discriminator
-
 
 
 def train_pix2pix_v2(generator, discriminator, train_loader, val_loader, device, 
@@ -790,48 +617,6 @@ def plot_training_history(history, earlystopping = None):
 # ---------------------------------------------------------
 # ---------------------------------------------------------
 
-def visualize_prediction(generator, dataloader, device):
-    """
-    Takes a single batch from the dataloader, generates a prediction using the trained model,
-    and plots the Input Map, Generated Image, and Real Image side-by-side.
-    
-    Args:
-        generator (nn.Module): The trained generator network.
-        dataloader (DataLoader): DataLoader to draw the sample from (usually validation or test set).
-        device (torch.device): The computation device.
-    """
-    print("Visualizing model prediction on a sample...")
-    generator.eval() # Ensure dropout/batchnorm layers are in evaluation mode
-    
-    with torch.no_grad():
-        # Get one batch of data
-        input_map, real_image = next(iter(dataloader))
-        input_map = input_map.to(device)
-        
-        # Generate the fake image
-        generated_image = generator(input_map)
-        
-        # Unnormalize and move tensors to CPU for matplotlib compatibility
-        # We grab the first image in the batch [0]
-        map_viz = unnormalize(input_map[0].cpu()).permute(1, 2, 0)
-        gen_viz = unnormalize(generated_image[0].cpu()).permute(1, 2, 0)
-        real_viz = unnormalize(real_image[0].cpu()).permute(1, 2, 0)
-        
-        # Plotting
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-        axes[0].imshow(map_viz)
-        axes[0].set_title("Input Map")
-        axes[0].axis("off")
-        
-        axes[1].imshow(gen_viz)
-        axes[1].set_title("Generated Image")
-        axes[1].axis("off")
-        
-        axes[2].imshow(real_viz)
-        axes[2].set_title("Real Image (Target)")
-        axes[2].axis("off")
-        
-        plt.show()
 
 
 def model_benchmark(generator, dataset, device, num_samples=3, indexes=None):
@@ -885,28 +670,58 @@ def model_benchmark(generator, dataset, device, num_samples=3, indexes=None):
     plt.tight_layout()
     plt.show()
 
-def evaluate_test_l1(generator, test_loader, device):
+
+
+def _pypure_ssim(img1, img2, window_size=11):
     """
-    Evaluates the generator's performance on the test dataset using the L1 loss metric.
+    Computes the Structural Similarity Index (SSIM) using pure PyTorch.
+    Standard implementation with a uniform/Gaussian window approach.
+    """
+    channel = img1.size(1)
 
-    This function sets the generator to evaluation mode and computes the average 
-    Mean Absolute Error (L1 loss) between the generated images and the ground truth 
-    across the entire test set. It provides a quantitative measure of the model's 
-    pixel-wise reconstruction accuracy.
+    # Gaussian filter for the local average
+    window = torch.ones((channel, 1, window_size, window_size), dtype=img1.dtype, device=img1.device)
+    window = window / (window_size * window_size)
+    
+    # Stability constants
+    C1 = 0.01 ** 2
+    C2 = 0.03 ** 2
+    
+    # Local averages
+    mu1 = F.conv2d(img1, window, padding=window_size//2, groups=channel)
+    mu2 = F.conv2d(img2, window, padding=window_size//2, groups=channel)
+    
+    mu1_sq = mu1.pow(2)
+    mu2_sq = mu2.pow(2)
+    mu1_mu2 = mu1 * mu2
+    
+    # variances and covariances
+    sigma1_sq = F.conv2d(img1 * img1, window, padding=window_size//2, groups=channel) - mu1_sq
+    sigma2_sq = F.conv2d(img2 * img2, window, padding=window_size//2, groups=channel) - mu2_sq
+    sigma12 = F.conv2d(img1 * img2, window, padding=window_size//2, groups=channel) - mu1_mu2
+    
+    # SSIM
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+    
+    return ssim_map.mean()
 
-    Args:
-        generator (nn.Module): The trained generator model to be evaluated.
-        test_loader (DataLoader): PyTorch DataLoader containing the test dataset.
-        device (torch.device): Computation device (e.g., 'cuda' or 'cpu').
 
-    Returns:
-        float: The average L1 loss value for the test set.
+def evaluate_test_metrics(generator, test_loader, device):
+    """
+    Evaluates the generator's performance on the test dataset using L1 loss,
+    SSIM, and PSNR. Written in pure PyTorch to avoid library import headaches.
+    
+    Assumes inputs are normalized in [-1, 1] and unnormalizes them to [0, 1] 
+    internally for correct perceptual metric evaluation.
     """
     generator.eval()
     criterion_l1 = nn.L1Loss()
-    total_test_l1 = 0.0
     
-    print(f"Runing L1 loss evaluation on Test set...")
+    total_test_l1 = 0.0
+    total_test_ssim = 0.0
+    total_test_psnr = 0.0
+    
+    print("Running evaluation (L1, SSIM, PSNR) on Test set...")
     
     with torch.no_grad():
         for condition_map, real_image in test_loader:
@@ -914,17 +729,41 @@ def evaluate_test_l1(generator, test_loader, device):
             real_image = real_image.to(device)
             
             fake_image = generator(condition_map)
-            loss_l1 = criterion_l1(fake_image, real_image)
             
+            # Compute L1 loss on the original range [-1, 1]
+            loss_l1 = criterion_l1(fake_image, real_image)
             total_test_l1 += loss_l1.item()
             
-    avg_test_l1 = total_test_l1 / len(test_loader)
-    print(f"AVERAGE L1 LOSS (TEST): {avg_test_l1:.6f}")
+            # dennormalze the iamges to the [0,1] range for SSIM and PSNR
+            real_image_unnorm = real_image * 0.5 + 0.5
+            fake_image_unnorm = fake_image * 0.5 + 0.5
+            fake_image_unnorm = torch.clamp(fake_image_unnorm, 0.0, 1.0)
+            
+            
+             
+            mse = F.mse_loss(fake_image_unnorm, real_image_unnorm, reduction='mean')
+            if mse.item() == 0:
+                psnr = 100.0  # avoid divide into zero
+            else:
+                psnr = 10 * torch.log10(1.0 / mse)
+            total_test_psnr += psnr.item()
+            
+            
+            ssim_val = _pypure_ssim(fake_image_unnorm, real_image_unnorm)
+            total_test_ssim += ssim_val.item()
+            
+    num_batches = len(test_loader)
+    avg_test_l1 = total_test_l1 / num_batches
+    avg_test_ssim = total_test_ssim / num_batches
+    avg_test_psnr = total_test_psnr / num_batches
     
-    return avg_test_l1
-
-
-
+    print("-" * 40)
+    print(f"AVERAGE L1 LOSS (TEST): {avg_test_l1:.6f}")
+    print(f"AVERAGE SSIM    (TEST): {avg_test_ssim:.4f}")
+    print(f"AVERAGE PSNR    (TEST): {avg_test_psnr:.2f} dB")
+    print("-" * 40)
+    
+    return avg_test_l1, avg_test_ssim, avg_test_psnr
 
 
 
