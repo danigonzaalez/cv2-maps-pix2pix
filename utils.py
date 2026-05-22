@@ -579,18 +579,16 @@ def plot_training_history(history, earlystopping = None):
     plt.figure(figsize=(12, 6))
     plt.title("Pix2Pix Training History: Generator vs Discriminator Loss")
     
-    # Extraer datos del diccionario
     train_G = history["train_G"]
     train_D = history["train_D"]
     val_G = history["val_G"]
     val_D = history["val_D"]
     epochs = range(1, len(train_G) + 1)
 
-    # Plot Train Losses (líneas sólidas)
+
     plt.plot(epochs, train_G, label="Train G Loss (Adversarial + L1)", color="blue", linestyle="-", linewidth=1.5)
     plt.plot(epochs, train_D, label="Train D Loss (PatchGAN)", color="orange", linestyle="-", linewidth=1.5)
     
-    # Plot Validation Losses (líneas discontinuas)
     plt.plot(epochs, val_G, label="Val G Loss", color="blue", linestyle="--", linewidth=1.5, alpha=0.7)
     plt.plot(epochs, val_D, label="Val D Loss", color="orange", linestyle="--", linewidth=1.5, alpha=0.7)
     
